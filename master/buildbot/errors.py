@@ -23,3 +23,8 @@ class PluginDBError(Exception):
 
 class CaptureCallbackError(Exception):
     pass
+
+
+class LDAPBindError(Exception):
+    """Could not bind to the LDAP server as the buildbot service user.
+    """

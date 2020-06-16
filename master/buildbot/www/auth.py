@@ -27,10 +27,10 @@ from twisted.cred.checkers import ICredentialsChecker
 from twisted.cred.checkers import InMemoryUsernamePasswordDatabaseDontUse
 from twisted.cred.credentials import IUsernamePassword
 from twisted.cred.error import UnauthorizedLogin
-from twisted.cred.error import LDAPAuthenticationError
 from twisted.cred.portal import IRealm
 from twisted.cred.portal import Portal
 from twisted.internet import defer
+from twisted.internet import threads
 from twisted.web.error import Error
 from twisted.web.guard import BasicCredentialFactory
 from twisted.web.guard import DigestCredentialFactory
@@ -38,9 +38,11 @@ from twisted.web.guard import HTTPAuthSessionWrapper
 from twisted.web.resource import IResource
 from zope.interface import implementer
 
+from buildbot.errors import LDAPBindError
 from buildbot.util import bytes2unicode
 from buildbot.util import config
 from buildbot.util import unicode2bytes
+from buildbot.util import service
 from buildbot.www import resource
 
 
@@ -58,9 +60,11 @@ class AuthRootResource(resource.Resource):
 class AuthBase(config.ConfiguredMixin):
 
     def __init__(self, userInfoProvider=None):
+        print('AuthBase.__init__')
         self.userInfoProvider = userInfoProvider
 
     def reconfigAuth(self, master, new_config):
+        print('AuthBase.reconfigAuth')
         self.master = master
 
     def maybeAutoLogin(self, request):
@@ -136,34 +140,61 @@ class RemoteUserAuth(AuthBase):
             yield self.updateUserInfo(request)
 
 
-class LDAPAuth(AuthBase):
+class LDAPAuth(service.BuildbotService, AuthBase):
     """
     Authenticate user against LDAP
     """
-    def __init__(self, server_uri: str, binddn: Optional[str] = None, bindpw: Optional[str] = None, **kwargs):
+    name = "ldap"
+
+    def __init__(self, server_uri: str, account_subtree: str,
+                 bb_bind_user: Optional[str] = None,
+                 bb_bind_password: Optional[str] = None,
+                 search_pattern=None, **kwargs):
         """
         :param server_uri: Server connection string (example: "ldaps://ldap.company.com:636")
-        :param binddn: The user permitted to search the LDAP directory
-        :param bindpw: Password for binddn user
+        :param account_subtree: LDAP subtree that contains users (example: "dc=example,dc=com")
+        :param bb_bind_user: The user permitted to search the LDAP directory
+        :param bb_bind_password: Password for bb_bind_user
+        :param search_pattern: The search pattern to compare users (default: "(uid={username})"),
+                               the '{username}' substring will be interpolated with the LDAP
+                               user's username
         """
+        print('LDAPAuth.__init__')
+        print(dir(self))
         super().__init__(**kwargs)
+        print(dir(self))
         self.server_uri = server_uri
-        self.binddn = binddn
-        self.bindpw = bindpw
+        self.account_subtree = account_subtree
+        self.bb_bind_user = bb_bind_user
+        self.bb_bind_password = bb_bind_password
+        self.search_pattern = search_pattern or '(uid={username})'
 
-    def requestAvatarId(self, cred):
+    @defer.inlineCallbacks
+    def authenticate(self, cred):
+        print('LDAPAuth.authenticate')
+        print(dir(self))
         server = urlparse(self.server_uri)
         s = ldap3.Server(server.hostname, port=server.port, use_ssl=server.scheme == 'ldaps', get_info=ldap3.ALL)
         with ldap3.Connection(s, auto_bind=True, client_strategy=ldap3.SYNC,
-                              user=self.binddn, password=self.bindpw, authentication=ldap3.SIMPLE) as c:
+                              user=self.bb_bind_user, password=self.bb_bind_password,
+                              authentication=ldap3.SIMPLE) as c:
             # Make sure we can connect to the server with the bind credentials
             if c.bind():
-                # Check if the credentials can authenticate
-                if c.rebind(user=cred.username, password=cred.password):
-                    return defer.succeed(cred.username)
+                # Search for the user
+                res = yield c.search(self.account_subtree, search_pattern.format(username=cred.username))
+
+                if not res or len(res.entries) == 1:
+                    # Check if the credentials can authenticate
+                    if c.rebind(user=cred.username, password=cred.password):
+                        return defer.succeed(cred.username)
             else:
-                return defer.fail(LDAPAuthenticationError())
+                return defer.fail(LDAPBindError())
         return defer.fail(UnauthorizedLogin())
+
+    def requestAvatarId(self, cred):
+        print('LDAPAuth.requestAvatarId')
+        print(dir(self))
+        return threads.deferToThread(self.authenticate, cred)
 
 
 @implementer(IRealm)
